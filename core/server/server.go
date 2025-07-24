@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"math/rand"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,6 +109,7 @@ type h3sHandler struct {
 	connID        uint32 // a random id for dump streams
 
 	udpSM *udpSessionManager // Only set after authentication
+	mark           uint32
 }
 
 func newH3sHandler(config *Config, conn quic.Connection) *h3sHandler {
@@ -113,6 +117,7 @@ func newH3sHandler(config *Config, conn quic.Connection) *h3sHandler {
 		config: config,
 		conn:   conn,
 		connID: rand.Uint32(),
+		mark:   0,
 	}
 }
 
@@ -137,6 +142,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Set authenticated flag
 			h.authenticated = true
 			h.authID = id
+			h.mark = parseMark(id)
 			if h.config.IgnoreClientBandwidth {
 				// Ignore client bandwidth, always use BBR
 				congestion.UseBBR(h.conn)
@@ -175,7 +181,14 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !h.config.DisableUDP {
 				go func() {
 					sm := newUDPSessionManager(
-						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
+						&udpIOImpl{
+							Conn:          h.conn,
+							AuthID:        id,
+							Mark:          h.mark,
+							TrafficLogger: h.config.TrafficLogger,
+							RequestHook:   h.config.RequestHook,
+							Outbound:      h.config.Outbound,
+						},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
 						h.config.UDPIdleTimeout)
 					h.udpSM = sm
@@ -270,6 +283,7 @@ func (h *h3sHandler) handleTCPRequest(stream quic.Stream) {
 		}
 		return
 	}
+	setSocketMark(tConn, h.mark)
 	if !hooked {
 		_ = protocol.WriteTCPResponse(stream, true, "Connected")
 	}
@@ -311,6 +325,7 @@ func (h *h3sHandler) masqHandler(w http.ResponseWriter, r *http.Request) {
 type udpIOImpl struct {
 	Conn          quic.Connection
 	AuthID        string
+	Mark           uint32
 	TrafficLogger TrafficLogger
 	RequestHook   RequestHook
 	Outbound      Outbound
@@ -366,7 +381,11 @@ func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {
 }
 
 func (io *udpIOImpl) UDP(reqAddr string) (UDPConn, error) {
-	return io.Outbound.UDP(reqAddr)
+	conn, err := io.Outbound.UDP(reqAddr)
+	if err == nil {
+		setSocketMark(conn.(net.Conn), io.Mark)
+	}
+	return conn, err
 }
 
 type udpEventLoggerImpl struct {
@@ -385,4 +404,25 @@ func (l *udpEventLoggerImpl) Close(sessionID uint32, err error) {
 	if l.EventLogger != nil {
 		l.EventLogger.UDPError(l.Conn.RemoteAddr(), l.AuthID, sessionID, err)
 	}
+}
+
+func parseMark(id string) uint32 {
+	idx := strings.LastIndex(id, "_")
+	if idx == -1 || idx == len(id)-1 {
+		return 0
+	}
+	segment := id[idx+1:]
+	var (
+		v   uint64
+		err error
+	)
+	if strings.HasPrefix(segment, "0x") || strings.HasPrefix(segment, "0X") {
+		v, err = strconv.ParseUint(segment[2:], 16, 32)
+	} else {
+		v, err = strconv.ParseUint(segment, 10, 32)
+	}
+	if err == nil && v <= 0xFFFF {
+		return uint32(v)
+	}
+	return 0
 }
